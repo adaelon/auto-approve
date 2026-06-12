@@ -19,7 +19,7 @@ pub enum ApprovalDecision {
 }
 
 /// Single input unit for auto-approval.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub enum InputChunk {
     /// Literal text to send to the PTY.
     Text(String),
@@ -49,6 +49,44 @@ impl Default for AutoApproveConfig {
             max_context_lines: 80,
             request_timeout_secs: 10,
         }
+    }
+}
+
+/// One line appended to `sessions/<id>/approval.log` per decision.
+#[derive(serde::Serialize)]
+pub struct ApprovalLogEntry {
+    pub ts: String,
+    pub decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<InputChunk>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Append one JSON line to `sessions/<session_id>/approval.log`.
+/// Silently warns on any I/O or serialization failure.
+pub fn append_approval_log(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    entry: &ApprovalLogEntry,
+) {
+    use std::io::Write as _;
+
+    let line = match serde_json::to_string(entry) {
+        Ok(l) => l,
+        Err(err) => {
+            warn!(%err, session_id, "approval log: serialize failed");
+            return;
+        }
+    };
+    let log_path = sessions_dir.join(session_id).join("approval.log");
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| writeln!(f, "{line}").map_err(Into::into));
+    if let Err(err) = result {
+        warn!(%err, session_id, "approval log: write failed");
     }
 }
 

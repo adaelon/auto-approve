@@ -93,14 +93,24 @@ pub(super) async fn run_notification_monitor(
                 };
 
             if let Some(ref approver) = auto_approver {
-                use crate::approval::ApprovalDecision;
+                use crate::approval::{ApprovalDecision, ApprovalLogEntry, append_approval_log};
                 let decision = approver.judge(excerpt.clone()).await;
                 match decision {
                     ApprovalDecision::Approve { chunks } => {
                         info!(session_id, "auto-approver approved, attempting to send input");
                         let ok = session_store.write_session_input(&session_id, &chunks).await;
                         if ok {
-                            warn!(session_id, "auto-approved: skipping human notification");
+                            append_approval_log(
+                                &config.sessions_dir,
+                                &session_id,
+                                &ApprovalLogEntry {
+                                    ts: chrono::Utc::now().to_rfc3339(),
+                                    decision: "approve".to_string(),
+                                    chunks: Some(chunks),
+                                    reason: None,
+                                },
+                            );
+                            info!(session_id, "auto-approved: skipping human notification");
                             session_store.mark_notified(
                                 &session_id,
                                 output_epoch,
@@ -114,9 +124,29 @@ pub(super) async fn run_notification_monitor(
                         );
                     }
                     ApprovalDecision::Deny { reason } => {
+                        append_approval_log(
+                            &config.sessions_dir,
+                            &session_id,
+                            &ApprovalLogEntry {
+                                ts: chrono::Utc::now().to_rfc3339(),
+                                decision: "deny".to_string(),
+                                chunks: None,
+                                reason: Some(reason.clone()),
+                            },
+                        );
                         warn!(session_id, %reason, "auto-approver denied, deferring to human");
                     }
                     ApprovalDecision::Uncertain { reason } => {
+                        append_approval_log(
+                            &config.sessions_dir,
+                            &session_id,
+                            &ApprovalLogEntry {
+                                ts: chrono::Utc::now().to_rfc3339(),
+                                decision: "uncertain".to_string(),
+                                chunks: None,
+                                reason: Some(reason.clone()),
+                            },
+                        );
                         warn!(
                             session_id,
                             %reason,
