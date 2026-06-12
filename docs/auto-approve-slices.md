@@ -36,7 +36,7 @@
 - **不做什么**: 不改 notification monitor；不新增非测试的 public API
 - **完成判据**: cargo check 通过；单元测试覆盖 Text 和 Key chunk 写入
 
-## Slice 6: Notification monitor 集成
+## Slice 6: Notification monitor 集成 ✅
 - **做什么**: `run_notification_monitor` 签名增加 `auto_approver: Option<Arc<AutoApprover>>`；在 candidate 循环 trigger 确定后、dispatch 人类通知前插入：
   - judge() 拿到 Approve → write_session_input → 成功则 mark_notified + continue（跳过人类通知），失败则 fall through
   - Deny / Uncertain → fall through 走原通知路径

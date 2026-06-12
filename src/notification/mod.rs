@@ -28,7 +28,7 @@ pub(super) async fn run_notification_monitor(
     config: Arc<AppConfig>,
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
-    _auto_approver: Option<std::sync::Arc<crate::approval::AutoApprover>>,
+    auto_approver: Option<std::sync::Arc<crate::approval::AutoApprover>>,
 ) {
     let silence = std::time::Duration::from_secs(config.silence_seconds);
     let suppression_window = std::time::Duration::from_secs(5);
@@ -91,6 +91,40 @@ pub(super) async fn run_notification_monitor(
                 } else {
                     continue;
                 };
+
+            if let Some(ref approver) = auto_approver {
+                use crate::approval::ApprovalDecision;
+                let decision = approver.judge(excerpt.clone()).await;
+                match decision {
+                    ApprovalDecision::Approve { chunks } => {
+                        info!(session_id, "auto-approver approved, attempting to send input");
+                        let ok = session_store.write_session_input(&session_id, &chunks).await;
+                        if ok {
+                            warn!(session_id, "auto-approved: skipping human notification");
+                            session_store.mark_notified(
+                                &session_id,
+                                output_epoch,
+                                std::time::Instant::now(),
+                            );
+                            continue;
+                        }
+                        warn!(
+                            session_id,
+                            "auto-approve write failed, falling through to human notification"
+                        );
+                    }
+                    ApprovalDecision::Deny { reason } => {
+                        warn!(session_id, %reason, "auto-approver denied, deferring to human");
+                    }
+                    ApprovalDecision::Uncertain { reason } => {
+                        warn!(
+                            session_id,
+                            %reason,
+                            "auto-approver uncertain, deferring to human"
+                        );
+                    }
+                }
+            }
 
             let body = sanitize_notification_excerpt(&excerpt);
             let event = NotificationEvent::input_needed_with_trigger(
