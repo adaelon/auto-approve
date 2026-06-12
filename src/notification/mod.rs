@@ -28,6 +28,7 @@ pub(super) async fn run_notification_monitor(
     config: Arc<AppConfig>,
     event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
     notification_tx: tokio::sync::broadcast::Sender<NotificationEvent>,
+    _auto_approver: Option<std::sync::Arc<crate::approval::AutoApprover>>,
 ) {
     let silence = std::time::Duration::from_secs(config.silence_seconds);
     let suppression_window = std::time::Duration::from_secs(5);

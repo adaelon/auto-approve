@@ -28,6 +28,8 @@ pub enum AppError {
     NodeNotConnected(String),
     #[error("max running sessions limit reached ({0})")]
     MaxSessionsReached(usize),
+    #[error("configuration error: {0}")]
+    Config(String),
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

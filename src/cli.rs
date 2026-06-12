@@ -134,6 +134,18 @@ pub struct DaemonStartArgs {
     /// Argon2 PHC hash passed from the parent process to the detached child; never set manually.
     #[arg(long, hide = true)]
     pub auth_hash_internal: Option<String>,
+    /// Enable auto-approval of interactive prompts using an LLM safety gate.
+    #[arg(long)]
+    pub auto_approve: bool,
+    /// Override the auto-approve API base URL (OpenAI-compatible).
+    #[arg(long, value_name = "URL")]
+    pub auto_approve_api_url: Option<String>,
+    /// Override the auto-approve API key.
+    #[arg(long, value_name = "KEY")]
+    pub auto_approve_api_key: Option<String>,
+    /// Override the auto-approve model name.
+    #[arg(long, value_name = "MODEL")]
+    pub auto_approve_model: Option<String>,
 }
 
 #[derive(Debug, Args)]

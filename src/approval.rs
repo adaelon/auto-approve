@@ -1,4 +1,4 @@
-﻿use std::time::Duration;
+use std::time::Duration;
 
 use serde::Deserialize;
 use tracing::{debug, warn};
@@ -28,7 +28,8 @@ pub enum InputChunk {
 }
 
 /// Auto-approve configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct AutoApproveConfig {
     pub enabled: bool,
     pub api_url: String,

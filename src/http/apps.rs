@@ -1009,6 +1009,7 @@ mod tests {
             session_eviction_seconds: 15,
             max_running_sessions: 10,
             notification_hook: None,
+            auto_approve: crate::approval::AutoApproveConfig::default(),
         }
     }
 

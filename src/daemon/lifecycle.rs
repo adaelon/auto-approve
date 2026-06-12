@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
+    approval::AutoApprover,
     client,
     config::AppConfig,
     db::Database,
@@ -189,6 +190,7 @@ pub async fn start(
             &config.http_bind,
             config.http_port,
             config.notification_hook.as_deref(),
+            &config.auto_approve,
         )?;
         wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
 
@@ -314,6 +316,7 @@ fn spawn_detached(
     bind: &str,
     port: u16,
     notification_hook: Option<&str>,
+    auto_approve: &crate::approval::AutoApproveConfig,
 ) -> Result<u32> {
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
@@ -341,6 +344,17 @@ fn spawn_detached(
     }
     if let Some(notification_hook) = notification_hook {
         cmd.arg("--notification-hook").arg(notification_hook);
+    }
+    if auto_approve.enabled {
+        cmd.arg("--auto-approve")
+            .arg("--auto-approve-api-url")
+            .arg(&auto_approve.api_url)
+            .arg("--auto-approve-model")
+            .arg(&auto_approve.model);
+        if !auto_approve.api_key.is_empty() {
+            // Never pass the key as a CLI arg — visible in `ps` output.
+            cmd.env("OLY_AUTO_APPROVE_API_KEY", &auto_approve.api_key);
+        }
     }
     // On Windows the spawned process must be placed in its own process group
     // and detached from the parent console.  Without these flags the daemon
@@ -378,9 +392,26 @@ fn spawn_detached(
 async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
     let config = Arc::new(config);
 
+    if config.auto_approve.enabled && config.auto_approve.api_key.is_empty() {
+        return Err(AppError::Config(
+            "auto-approve is enabled but api_key is empty; \
+             set it in config.json or via OLY_AUTO_APPROVE_API_KEY"
+                .to_string(),
+        ));
+    }
+
+    let auto_approver: Option<std::sync::Arc<AutoApprover>> = if config.auto_approve.enabled {
+        Some(std::sync::Arc::new(AutoApprover::new(
+            config.auto_approve.clone(),
+        )))
+    } else {
+        None
+    };
+
     info!(
         no_http,
         auth_enabled = auth_hash.is_some(),
+        auto_approve_enabled = config.auto_approve.enabled,
         state_dir = ?config.state_dir,
         sessions_dir = ?config.sessions_dir,
         "daemon foreground initialization"
@@ -498,6 +529,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
     let notify_event_tx = event_tx.clone();
     let notify_notification_tx = notification_tx.clone();
     let notify_notifier = notifier.clone();
+    let notify_auto_approver = auto_approver.clone();
     tokio::spawn(async move {
         crate::notification::run_notification_monitor(
             notify_notifier,
@@ -505,6 +537,7 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
             notify_config,
             notify_event_tx,
             notify_notification_tx,
+            notify_auto_approver,
         )
         .await;
     });
@@ -597,7 +630,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{detached_start_summary, format_status_timestamp};
-    use crate::config::AppConfig;
+    use crate::approval::AutoApproveConfig;
+use crate::config::AppConfig;
 
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
@@ -621,6 +655,7 @@ mod tests {
             session_eviction_seconds: 15,
             max_running_sessions: 50,
             notification_hook: None,
+            auto_approve: AutoApproveConfig::default(),
         }
     }
 

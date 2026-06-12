@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::approval::AutoApproveConfig;
 use crate::error::Result;
 
 /// Default prompt patterns used to detect interactive prompts in terminal output.
@@ -64,6 +65,7 @@ pub struct AppConfig {
     /// Optional path to an executable invoked on every local OS notification.
     /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
     pub notification_hook: Option<String>,
+    pub auto_approve: AutoApproveConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -80,6 +82,7 @@ struct AppConfigOverrides {
     /// Path to an executable invoked on every local OS notification.
     /// Event data is provided via environment variables (OLY_EVENT_*).
     notification_hook: Option<String>,
+    auto_approve: Option<AutoApproveConfig>,
 }
 
 impl AppConfig {
@@ -123,6 +126,17 @@ impl AppConfig {
             .notification_hook
             .and_then(normalize_optional_string);
 
+        let auto_approve = {
+            let mut cfg = overrides.auto_approve.unwrap_or_default();
+            if let Some(key) = std::env::var("OLY_AUTO_APPROVE_API_KEY")
+                .ok()
+                .and_then(normalize_optional_string)
+            {
+                cfg.api_key = key;
+            }
+            cfg
+        };
+
         Ok(Self {
             log_level,
             silence_seconds: 10,
@@ -143,6 +157,7 @@ impl AppConfig {
             sessions_dir,
             max_running_sessions,
             notification_hook,
+            auto_approve,
         })
     }
 
@@ -151,6 +166,10 @@ impl AppConfig {
         http_bind: Option<String>,
         http_port: Option<u16>,
         notification_hook: Option<String>,
+        auto_approve_enabled: Option<bool>,
+        auto_approve_api_url: Option<String>,
+        auto_approve_api_key: Option<String>,
+        auto_approve_model: Option<String>,
     ) -> Self {
         if let Some(http_bind) = http_bind.and_then(normalize_optional_string) {
             self.http_bind = http_bind;
@@ -160,6 +179,18 @@ impl AppConfig {
         }
         if let Some(notification_hook) = notification_hook.and_then(normalize_optional_string) {
             self.notification_hook = Some(notification_hook);
+        }
+        if let Some(enabled) = auto_approve_enabled {
+            self.auto_approve.enabled = enabled;
+        }
+        if let Some(url) = auto_approve_api_url.and_then(normalize_optional_string) {
+            self.auto_approve.api_url = url;
+        }
+        if let Some(key) = auto_approve_api_key.and_then(normalize_optional_string) {
+            self.auto_approve.api_key = key;
+        }
+        if let Some(model) = auto_approve_model.and_then(normalize_optional_string) {
+            self.auto_approve.model = model;
         }
         self
     }
@@ -277,7 +308,7 @@ fn normalize_optional_string(value: String) -> Option<String> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::AppConfig;
+    use super::{AppConfig, AutoApproveConfig};
 
     fn test_config() -> AppConfig {
         let state_dir = PathBuf::from("test-state");
@@ -301,6 +332,7 @@ mod tests {
             session_eviction_seconds: 15,
             max_running_sessions: 50,
             notification_hook: Some("config-hook".to_string()),
+            auto_approve: AutoApproveConfig::default(),
         }
     }
 
@@ -310,6 +342,10 @@ mod tests {
             Some(" 0.0.0.0 ".to_string()),
             Some(17000),
             Some("  C:/tools/notify.exe  ".to_string()),
+            None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(config.http_bind, "0.0.0.0");
@@ -322,10 +358,45 @@ mod tests {
 
     #[test]
     fn runtime_overrides_leave_config_values_when_not_provided() {
-        let config = test_config().with_runtime_overrides(None, None, None);
+        let config = test_config().with_runtime_overrides(None, None, None, None, None, None, None);
 
         assert_eq!(config.http_bind, "127.0.0.1");
         assert_eq!(config.http_port, 15443);
         assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
+    }
+
+    #[test]
+    fn runtime_overrides_apply_auto_approve_fields() {
+        let config = test_config().with_runtime_overrides(
+            None,
+            None,
+            None,
+            Some(true),
+            Some("https://custom.api/v1".to_string()),
+            Some("sk-test".to_string()),
+            Some("gpt-4o".to_string()),
+        );
+
+        assert!(config.auto_approve.enabled);
+        assert_eq!(config.auto_approve.api_url, "https://custom.api/v1");
+        assert_eq!(config.auto_approve.api_key, "sk-test");
+        assert_eq!(config.auto_approve.model, "gpt-4o");
+    }
+
+    #[test]
+    fn runtime_overrides_skip_empty_auto_approve_strings() {
+        let config = test_config().with_runtime_overrides(
+            None,
+            None,
+            None,
+            None,
+            Some("   ".to_string()),
+            Some("".to_string()),
+            Some("  ".to_string()),
+        );
+
+        assert_eq!(config.auto_approve.api_url, AutoApproveConfig::default().api_url);
+        assert_eq!(config.auto_approve.api_key, "");
+        assert_eq!(config.auto_approve.model, AutoApproveConfig::default().model);
     }
 }

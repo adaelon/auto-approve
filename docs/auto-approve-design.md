@@ -115,20 +115,29 @@ Rules:
 
 ## 6. 集成点
 
-### 6.1 核心入口：input_needed 触发
+### 6.1 核心入口：notification monitor 触发
 
-当前流程（\src/notification/dispatcher.rs\）：
-  input_needed 变 true → 发桌面通知 / 调 hook
+当前流程（`src/notification/mod.rs`）：
+  silent_candidates() 检测到候选 → 匹配 trigger rule → 发桌面通知 / 调 hook
 
-新增流程：
-  input_needed 变 true →
-    if auto_approve.enabled:
-      screen_text = session.screen_parser.screen().to_string()
-      AutoApprover::judge(screen_text) →
-        Approve → try_write_input(chunks) + 重置 input_needed + 记日志
-        Deny/Uncertain → 走原有通知路径
-    else:
-      走原有通知路径
+新增流程（在 trigger 确定后、dispatch 人类通知前）：
+  if auto_approver.is_some():
+    screen_text = candidate.excerpt            // render_logs(15) 的渲染输出，非 screen_parser.screen()
+    AutoApprover::judge(screen_text) →
+      Approve { chunks } →
+        session_store.write_session_input(session_id, chunks)
+          成功 → mark_notified + continue（跳过人类通知）+ 记日志
+          失败 → fall through 走人类通知路径
+      Deny / Uncertain → fall through 走人类通知路径
+  else:
+    走原有通知路径
+
+**screen_text 来源说明**：使用 `SilentCandidate.excerpt`（`render_logs(15, false, u16::MAX)` 的渲染输出），
+而非 `screen_parser.screen().to_string()`。通知监控已经截好这段文本，复用即可，无需重复读 vt100 screen。
+
+**trigger rule 策略**：对全部三种触发规则（RegexPattern / LlmCheck / Silence）均调用 `judge()`。
+理由：让 LLM 自己看屏幕内容决定是否有可审批的 prompt；Silence 触发时若屏幕无 prompt，LLM 会返回 Uncertain，
+自然 fall through 走人类通知路径，无需在 daemon 层额外区分。
 
 ### 6.2 AutoApprover 实现
 
@@ -143,10 +152,24 @@ impl AutoApprover {
 }
 \\\
 
-### 6.3 写入输入后重置通知状态
+### 6.3 InputChunk 到字节的翻译
 
-自动发送后需重置 \input_needed\ 并跳过本轮人类通知，
-避免"刚自动批准又弹通知"。
+`SessionStore::write_session_input` 负责翻译 `InputChunk` 并调用 `pty.try_write_input`：
+
+- `InputChunk::Text(s)` → `s.as_bytes().to_vec()`
+- `InputChunk::Key(k)` → 调用 `crate::client::send::parse_key_spec(&k)`
+  - 成功 → 取结果字符串的字节
+  - 失败（未知 key name）→ `warn!` 并跳过该 chunk，返回 `false`
+
+`parse_key_spec` 在 `src/client/send.rs:228`，已标注 `pub`，daemon 侧直接 `use crate::client::send::parse_key_spec` 即可，无需重复实现 key 表。
+
+**连带修复**：`src/session/store.rs` 的测试助手 `make_test_config`（line ~1897）构造 `AppConfig` 字面量时，
+需在 S3 提交时同步加 `auto_approve: AutoApproveConfig::default()`，否则 `cargo check` 失败。
+
+### 6.4 写入输入后重置通知状态
+
+自动发送后调用 `mark_notified` 并在循环中 `continue`，跳过本轮人类通知，
+避免"刚自动批准又弹通知"。写入 PTY 失败时不调用 `mark_notified`，直接 fall through 走人类通知路径。
 
 ## 7. 错误处理
 

@@ -15,6 +15,8 @@ use tokio::sync::{Mutex as TokioMutex, broadcast};
 use tracing::{debug, info, trace, warn};
 
 use crate::{
+    approval::InputChunk,
+    client::parse_key_spec,
     config::AppConfig,
     db::Database,
     db::meta_to_summary,
@@ -688,6 +690,37 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Send auto-approve input chunks to a running session's PTY.
+    /// Returns `false` if the session is not running, a key spec is unknown,
+    /// or any PTY write fails; `true` only when every chunk was sent.
+    pub async fn write_session_input(&self, session_id: &str, chunks: &[InputChunk]) -> bool {
+        let handle = match self.lookup_runtime(session_id).await {
+            Ok(h) => h,
+            Err(_) => {
+                warn!(session_id, "write_session_input: session not running");
+                return false;
+            }
+        };
+        let rt = handle.read();
+        for chunk in chunks {
+            let bytes: Vec<u8> = match chunk {
+                InputChunk::Text(s) => s.as_bytes().to_vec(),
+                InputChunk::Key(k) => match parse_key_spec(k) {
+                    Ok(s) => s.into_bytes(),
+                    Err(err) => {
+                        warn!(key = %k, %err, "write_session_input: unknown key spec");
+                        return false;
+                    }
+                },
+            };
+            if let Err(err) = rt.pty.try_write_input(bytes) {
+                warn!(session_id, %err, "write_session_input: PTY write failed");
+                return false;
+            }
+        }
+        true
+    }
+
     pub async fn attach_busy(&self, id: &str) -> std::result::Result<(), SessionError> {
         let handle = self.lookup_runtime(id).await?;
         let summary = {
@@ -1203,6 +1236,7 @@ fn build_soft_stop_schedule(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::AutoApproveConfig;
     use crate::session::{SessionMeta, SessionStatus, pty::collect_chunk_bytes};
     use chrono::Utc;
     use std::sync::Arc;
@@ -1882,6 +1916,66 @@ mod tests {
         (rt, writer_rx)
     }
 
+    /// Like `make_runtime_writable` but uses a mock child so no real process is spawned.
+    /// Avoids PTY resource contention when multiple tests run in parallel.
+    fn make_runtime_writable_mock(
+        id: &str,
+        status: SessionStatus,
+    ) -> (
+        Arc<RwLock<super::super::runtime::SessionRuntime>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        use tokio::sync::{broadcast, mpsc};
+
+        let dir =
+            std::env::temp_dir().join(format!("oly_store_mock_{id}_{}", uuid::Uuid::new_v4()));
+        let meta = SessionMeta {
+            id: id.to_string(),
+            title: None,
+            tags: vec![],
+            command: "sh".to_string(),
+            args: vec![],
+            cwd: None,
+            created_at: Utc::now(),
+            started_at: Some(Utc::now()),
+            ended_at: None,
+            status,
+            pid: None,
+            exit_code: None,
+        };
+        let (broadcast_tx, _rx) = broadcast::channel(4);
+        let (resize_tx, _resize_rx) = broadcast::channel(4);
+        let (writer_tx, writer_rx) = mpsc::channel(8);
+        let rt = Arc::new(RwLock::new(super::super::runtime::SessionRuntime {
+            meta,
+            dir,
+            last_total_bytes: 0,
+            raw_total_bytes: 0,
+            broadcast_tx,
+            resize_tx,
+            pty: super::super::pty::PtyHandle {
+                child: super::super::pty::RuntimeChild::Mock { exit_code: None },
+                writer_tx,
+                pty_master: parking_lot::Mutex::new(None),
+            },
+            pty_size: None,
+            resize_history: Vec::new(),
+            completed_at: None,
+            persisted: false,
+            requested_final_status: None,
+            last_output_epoch: None,
+            last_input_at: None,
+            last_attach_activity_at: None,
+            attach_count: 0,
+            last_notified_at: None,
+            notified_output_epoch: None,
+            screen_parser: vt100::Parser::new(24, 80, 0),
+            output_closed: false,
+            notifications_enabled: true,
+        }));
+        (rt, writer_rx)
+    }
+
     #[test]
     fn instant_to_utc_reconstructs_recent_wall_clock_time() {
         use super::super::runtime::instant_to_utc;
@@ -1916,6 +2010,7 @@ mod tests {
             lock_file: PathBuf::from("."),
             max_running_sessions,
             notification_hook: None,
+            auto_approve: AutoApproveConfig::default(),
         }
     }
 
@@ -2172,6 +2267,50 @@ mod tests {
             started.elapsed() < ATTACH_INPUT_OUTPUT_WAIT_TIMEOUT,
             "attach_input should return before the timeout once output advances"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_session_input
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn write_session_input_text_chunk_sends_raw_bytes() {
+        let (rt, mut writer_rx) = make_runtime_writable_mock("wsi001", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+        let chunks = vec![InputChunk::Text("yes".to_string())];
+        let ok = store.write_session_input("wsi001", &chunks).await;
+        assert!(ok, "write_session_input should return true for text chunk");
+        let received = writer_rx.recv().await.expect("should receive bytes");
+        assert_eq!(received, b"yes");
+    }
+
+    #[tokio::test]
+    async fn write_session_input_key_chunk_translates_enter() {
+        let (rt, mut writer_rx) = make_runtime_writable_mock("wsi002", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+        let chunks = vec![InputChunk::Key("enter".to_string())];
+        let ok = store.write_session_input("wsi002", &chunks).await;
+        assert!(ok, "write_session_input should return true for key:enter");
+        let received = writer_rx.recv().await.expect("should receive bytes");
+        assert_eq!(received, b"\r", "enter should map to carriage return");
+    }
+
+    #[tokio::test]
+    async fn write_session_input_unknown_session_returns_false() {
+        let store = SessionStore::new(900, make_test_db().await);
+        let chunks = vec![InputChunk::Text("y".to_string())];
+        let ok = store.write_session_input("no_such_id", &chunks).await;
+        assert!(!ok, "write_session_input should return false for unknown session");
+    }
+
+    #[tokio::test]
+    async fn write_session_input_unknown_key_returns_false() {
+        let (rt, _writer_rx) = make_runtime_writable_mock("wsi004", SessionStatus::Running);
+        let store = store_with(vec![rt], make_test_db().await);
+        // "f99" is not a valid key spec
+        let chunks = vec![InputChunk::Key("f99".to_string())];
+        let ok = store.write_session_input("wsi004", &chunks).await;
+        assert!(!ok, "write_session_input should return false for unrecognised key");
     }
 
     #[tokio::test]
