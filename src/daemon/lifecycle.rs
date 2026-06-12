@@ -1,0 +1,667 @@
+use std::{fmt::Write as _, fs::File, process::Stdio, sync::Arc, time::Duration};
+
+use interprocess::local_socket::traits::tokio::Listener as _;
+use tokio::sync::{Mutex, mpsc};
+use tracing::{error, info, warn};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+use crate::{
+    client,
+    config::AppConfig,
+    db::Database,
+    error::{AppError, Result},
+    http,
+    http::AuthState,
+    ipc,
+    node::NodeRegistry,
+    notification::event::NotificationEvent,
+    protocol::{RpcRequest, RpcResponse},
+    session::SessionStore,
+    storage,
+    utils::format_http_url,
+};
+
+use super::{
+    JoinHandles, NotifierHandle,
+    auth::{confirm_no_auth_risk, prompt_and_hash_password},
+    rpc::handle_client,
+};
+
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(120);
+const LOCK_STARTUP_GRACE: Duration = Duration::from_secs(3);
+
+pub struct DaemonGuard {
+    _lock: File,
+    config: Arc<AppConfig>,
+}
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = storage::remove_file_if_exists(&self.config.lock_file);
+        let _ = storage::remove_file_if_exists(&self.config.info_file);
+        let _ = storage::remove_file_if_exists(&self.config.socket_file);
+    }
+}
+
+fn build_env_filter(config: &AppConfig) -> tracing_subscriber::EnvFilter {
+    if let Ok(filter) = std::env::var("RUST_LOG") {
+        return tracing_subscriber::EnvFilter::try_new(filter)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    }
+
+    tracing_subscriber::EnvFilter::try_new(config.log_level.as_str())
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+}
+
+async fn daemon_is_healthy(config: &AppConfig) -> bool {
+    matches!(
+        ipc::send_request(config, RpcRequest::Health).await,
+        Ok(RpcResponse::Health { .. })
+    )
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    type Handle = *mut core::ffi::c_void;
+
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+
+        let mut exit_code = 0;
+        let ok = GetExitCodeProcess(process, &mut exit_code);
+        let _ = CloseHandle(process);
+        ok != 0 && exit_code == STILL_ACTIVE
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    const EPERM: i32 = 1;
+
+    unsafe {
+        if kill(pid as i32, 0) == 0 {
+            return true;
+        }
+
+        std::io::Error::last_os_error().raw_os_error() == Some(EPERM)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+async fn acquire_daemon_start_lock(config: &AppConfig) -> Result<File> {
+    let deadline = std::time::Instant::now() + LOCK_STARTUP_GRACE;
+
+    loop {
+        match storage::try_acquire_daemon_lock(&config.lock_file) {
+            Ok(file) => return Ok(file),
+            Err(AppError::DaemonAlreadyRunning) => {
+                if daemon_is_healthy(config).await {
+                    return Err(AppError::DaemonAlreadyRunning);
+                }
+
+                if let Some(pid) = storage::read_pid(&config.lock_file)? {
+                    if process_is_running(pid) {
+                        return Err(AppError::DaemonAlreadyRunning);
+                    }
+                }
+
+                if std::time::Instant::now() >= deadline {
+                    storage::remove_file_if_exists(&config.lock_file)?;
+                    storage::remove_file_if_exists(&config.socket_file)?;
+                    return storage::try_acquire_daemon_lock(&config.lock_file);
+                }
+
+                tokio::time::sleep(LOCK_RETRY_INTERVAL).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+pub async fn start(
+    config: AppConfig,
+    detach: bool,
+    foreground_internal: bool,
+    no_auth: bool,
+    no_auth_without_ask: bool,
+    no_http: bool,
+    auth_hash_internal: Option<String>,
+) -> Result<()> {
+    if daemon_is_healthy(&config).await {
+        return Err(AppError::DaemonAlreadyRunning);
+    }
+
+    let no_auth = no_auth || no_auth_without_ask;
+
+    let auth_hash: Option<String> = if foreground_internal {
+        // Prefer the env var (new, secure), fall back to the CLI arg (legacy).
+        auth_hash_internal.or_else(|| {
+            std::env::var("OLY_AUTH_HASH_INTERNAL").ok().and_then(|v| {
+                // Clear immediately after reading to minimise exposure window.
+                // SAFETY: We are the only thread reading this variable at startup.
+                unsafe { std::env::remove_var("OLY_AUTH_HASH_INTERNAL") };
+                if v.is_empty() { None } else { Some(v) }
+            })
+        })
+    } else if !no_http {
+        if no_auth {
+            if no_auth_without_ask {
+                warn!(
+                    "HTTP authentication disabled without confirmation. Make sure you understand the security implications."
+                );
+            } else {
+                confirm_no_auth_risk()?;
+            }
+            None
+        } else {
+            let hash = prompt_and_hash_password()?;
+            Some(hash)
+        }
+    } else {
+        None
+    };
+
+    if detach && !foreground_internal {
+        let child_pid = spawn_detached(
+            no_auth,
+            no_http,
+            auth_hash.as_deref(),
+            &config.http_bind,
+            config.http_port,
+            config.notification_hook.as_deref(),
+        )?;
+        wait_for_daemon_ready(&config, Some(child_pid), std::time::Duration::from_secs(60)).await?;
+
+        println!("Daemon started in background.");
+        print_detached_start_summary(&config, no_http, no_auth);
+        return Ok(());
+    }
+
+    run_foreground(config, auth_hash, no_http).await
+}
+
+pub async fn status(config: AppConfig) -> Result<()> {
+    if !daemon_is_healthy(&config).await {
+        eprintln!("Daemon is not running.");
+        return Ok(());
+    }
+
+    println!("Daemon is running...");
+
+    let (no_http, no_auth, started_at) = storage::read_daemon_info(&config.info_file)?
+        .map(|i| (i.no_http, i.no_auth, Some(i.started_at)))
+        .unwrap_or((false, false, None));
+
+    if let Some(started_at) = started_at {
+        println!("Started at:   {}", format_status_timestamp(&started_at));
+    }
+
+    print_detached_start_summary(&config, no_http, no_auth);
+    Ok(())
+}
+
+fn format_status_timestamp(value: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Local).to_rfc3339())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+fn print_detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) {
+    print!("{}", detached_start_summary(config, no_http, no_auth));
+}
+
+fn detached_start_summary(config: &AppConfig, no_http: bool, no_auth: bool) -> String {
+    let mut out = String::new();
+
+    if no_http {
+        let _ = writeln!(out, "HTTP:         disabled (--no-http)");
+    } else {
+        let _ = writeln!(
+            out,
+            "HTTP:         {}",
+            format_http_url(&config.http_bind, config.http_port)
+        );
+        let _ = writeln!(
+            out,
+            "Auth:         {}",
+            if no_auth {
+                "disabled (--no-auth)"
+            } else {
+                "enabled"
+            }
+        );
+    }
+
+    let _ = writeln!(out, "ROOT:         {}", config.state_dir.display());
+    let _ = writeln!(
+        out,
+        "LOGS:         {}",
+        config.state_dir.join("logs").display()
+    );
+    let _ = writeln!(out, "SESSIONS:     {}", config.sessions_dir.display());
+    out
+}
+
+pub async fn stop(config: AppConfig, grace_seconds: u64) -> Result<()> {
+    match ipc::send_request_checked(&config, RpcRequest::DaemonStop { grace_seconds }).await? {
+        RpcResponse::DaemonStop { stopped } => {
+            if !stopped {
+                eprintln!(
+                    "warning: daemon stopped but one or more sessions may not have stopped cleanly"
+                );
+            }
+            Ok(())
+        }
+        _ => Err(AppError::Protocol("unexpected response type".to_string())),
+    }
+}
+
+async fn wait_for_daemon_ready(
+    config: &AppConfig,
+    expected_pid: Option<u32>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if daemon_is_healthy(config).await {
+            return Ok(());
+        }
+
+        // For detached start, track the actual spawned child PID rather than the
+        // lockfile PID, which may still contain a stale value until the new daemon
+        // acquires the startup lock and writes its own PID.
+        if let Some(pid) = expected_pid {
+            if !process_is_running(pid) {
+                return Err(AppError::DaemonUnavailable(format!(
+                    "daemon process exited before becoming ready. Check logs under {}",
+                    config.state_dir.display()
+                )));
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+
+    Err(AppError::DaemonUnavailable(
+        "daemon failed to become ready in time".to_string(),
+    ))
+}
+
+fn spawn_detached(
+    no_auth: bool,
+    no_http: bool,
+    auth_hash: Option<&str>,
+    bind: &str,
+    port: u16,
+    notification_hook: Option<&str>,
+) -> Result<u32> {
+    let exe = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg("start")
+        .arg("--foreground-internal")
+        .arg("--bind")
+        .arg(bind)
+        .arg("--port")
+        .arg(port.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if no_auth {
+        cmd.arg("--no-auth");
+    } else if let Some(hash) = auth_hash {
+        // Pass the Argon2 hash via an environment variable instead of a CLI
+        // argument.  CLI args are visible to all local users via `ps aux` /
+        // `/proc/<pid>/cmdline`, which would leak the PHC hash.
+        cmd.env("OLY_AUTH_HASH_INTERNAL", hash);
+    }
+
+    if no_http {
+        cmd.arg("--no-http");
+    }
+    if let Some(notification_hook) = notification_hook {
+        cmd.arg("--notification-hook").arg(notification_hook);
+    }
+    // On Windows the spawned process must be placed in its own process group
+    // and detached from the parent console.  Without these flags the daemon
+    // stays in the same console process group as the launching terminal; closing
+    // that terminal sends CTRL_CLOSE_EVENT to every process in the group and
+    // kills the daemon silently.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS  (0x00000008): no console window, detached from parent console
+        // CREATE_NEW_PROCESS_GROUP (0x00000200): own signal group, won't receive Ctrl+C/Break from parent
+        cmd.creation_flags(0x00000008 | 0x00000200);
+    }
+    // On Unix the child must start a new session so it is not killed by SIGHUP
+    // when the launching terminal closes.  This mirrors the Windows
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP flags above.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Safety: setsid() is async-signal-safe (POSIX.1-2008).
+        unsafe {
+            cmd.pre_exec(|| {
+                unsafe extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+    }
+    let child = cmd.spawn()?;
+    Ok(child.id())
+}
+
+async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: bool) -> Result<()> {
+    let config = Arc::new(config);
+
+    info!(
+        no_http,
+        auth_enabled = auth_hash.is_some(),
+        state_dir = ?config.state_dir,
+        sessions_dir = ?config.sessions_dir,
+        "daemon foreground initialization"
+    );
+
+    storage::ensure_state_dirs(&config.state_dir, &config.sessions_dir)?;
+
+    let lock = acquire_daemon_start_lock(&config).await?;
+
+    storage::write_pid(&config.lock_file, std::process::id())?;
+
+    let no_auth = auth_hash.is_none();
+    storage::write_daemon_info(
+        &config.info_file,
+        &storage::DaemonInfo {
+            no_http,
+            no_auth,
+            started_at: chrono::Utc::now().to_rfc3339(),
+        },
+    )?;
+
+    let _guard = DaemonGuard {
+        _lock: lock,
+        config: Arc::clone(&config),
+    };
+
+    let file_appender =
+        tracing_appender::rolling::daily(config.state_dir.join("logs"), "daemon.log");
+    let (non_blocking, _log_guard) = tracing_appender::non_blocking(file_appender);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false);
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .compact()
+        .without_time()
+        .with_target(false);
+
+    let env_filter = build_env_filter(&config);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(file_layer)
+        .with(stderr_layer)
+        .init();
+
+    let pid = std::process::id();
+    info!(pid, log_level = %config.log_level, "daemon started");
+
+    let db = Arc::new(Database::open(&config.db_file, config.sessions_dir.clone()).await?);
+    info!(db_file = ?config.db_file, "database opened");
+
+    let node_registry = Arc::new(NodeRegistry::new());
+    let (notification_tx, _) = tokio::sync::broadcast::channel::<NotificationEvent>(100);
+
+    let join_handles: JoinHandles = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // Remove any stale socket file left by a crashed daemon.  On macOS (and
+    // other platforms without abstract-namespace sockets) the file-based Unix
+    // domain socket persists on disk after an unclean exit.  Binding to an
+    // existing socket file fails with EADDRINUSE, which silently prevents the
+    // daemon from starting and makes the parent `wait_for_daemon_ready` loop
+    // appear to hang.
+    storage::remove_file_if_exists(&config.socket_file)?;
+
+    let listener = ipc::bind(&config)?;
+    info!(socket_file = ?config.socket_file, "ipc listener bound");
+    let (store, startup_failed_sessions) = {
+        let store = SessionStore::new(config.session_eviction_seconds, db.clone());
+        let startup_failed_sessions = store.load_running_stopping_sessions().await;
+        (store, startup_failed_sessions)
+    };
+    let session_store = Arc::new(store);
+    let event_tx = session_store.event_tx();
+    for join in client::join::load_join_configs(&config) {
+        let (abort, stop_tx) = super::rpc_nodes::spawn_join_connector(
+            join.clone(),
+            Arc::clone(&config),
+            event_tx.subscribe(),
+        );
+        join_handles
+            .lock()
+            .await
+            .insert(join.name, (abort, stop_tx));
+    }
+    {
+        let count = join_handles.lock().await.len();
+        info!(count, "join connectors initialized");
+    }
+    let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
+    let notifier: NotifierHandle =
+        Arc::new(crate::notification::build_notifier(db.clone(), &config));
+
+    let auth_state = auth_hash.map(AuthState::new);
+    if !no_http {
+        let http_state = http::AppState {
+            store: session_store.clone(),
+            config: Arc::clone(&config),
+            db: db.clone(),
+            notifier: notifier.clone(),
+            event_tx: event_tx.clone(),
+            auth: auth_state,
+            node_registry: node_registry.clone(),
+        };
+        tokio::spawn(http::serve(http_state));
+        info!("http server task spawned");
+    } else {
+        info!("http server disabled by --no-web");
+    }
+
+    let notify_store = session_store.clone();
+    let notify_config = Arc::clone(&config);
+    let notify_event_tx = event_tx.clone();
+    let notify_notification_tx = notification_tx.clone();
+    let notify_notifier = notifier.clone();
+    tokio::spawn(async move {
+        crate::notification::run_notification_monitor(
+            notify_notifier,
+            notify_store,
+            notify_config,
+            notify_event_tx,
+            notify_notification_tx,
+        )
+        .await;
+    });
+    info!("notification monitor task spawned");
+
+    if !startup_failed_sessions.is_empty() {
+        let notifier = notifier.clone();
+        let event = NotificationEvent::startup_recovery(&startup_failed_sessions);
+        let outcome = notifier.dispatch(&event).await;
+
+        if outcome.any_delivered() {
+            info!(
+                count = startup_failed_sessions.len(),
+                delivered = outcome.delivered,
+                attempted = outcome.attempted,
+                "startup stale-session notification delivered"
+            );
+        } else {
+            warn!(
+                count = startup_failed_sessions.len(),
+                attempted = outcome.attempted,
+                failed_channels = ?outcome.failed_channels,
+                "startup stale-session notification failed on all channels"
+            );
+        }
+
+        let _ = notification_tx.send(event.clone());
+        let _ = event_tx.send(event.into_session_event(0, true));
+    }
+
+    let mut session_maintenance_tick = tokio::time::interval(Duration::from_secs(1));
+    session_maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("daemon received ctrl-c, shutting down");
+                break;
+            }
+            _ = shutdown_rx.recv() => {
+                info!("daemon received stop request, shutting down");
+                break;
+            }
+            _ = session_maintenance_tick.tick() => {
+                session_store.run_maintenance().await;
+            }
+            incoming = listener.accept() => {
+                match incoming {
+                    Ok(stream) => {
+                        let config_clone = Arc::clone(&config);
+                        let store_clone = session_store.clone();
+                        let shutdown_tx_clone = shutdown_tx.clone();
+                        let registry_clone = node_registry.clone();
+                        let db_clone = db.clone();
+                        let handles_clone = join_handles.clone();
+                        let event_tx_clone = event_tx.clone();
+                        let notification_tx_clone = notification_tx.clone();
+                        let notifier_clone = notifier.clone();
+                        tokio::spawn(async move {
+                            if let Err(err) = handle_client(
+                                stream,
+                                config_clone,
+                                store_clone,
+                                shutdown_tx_clone,
+                                registry_clone,
+                                db_clone,
+                                handles_clone,
+                                event_tx_clone,
+                                notification_tx_clone,
+                                notifier_clone,
+                            ).await {
+                                error!(%err, "client handling error");
+                            }
+                        });
+                    }
+                    Err(err) => {
+                        error!(%err, "accept error");
+                    }
+                }
+            }
+        }
+    }
+
+    info!("daemon stopped");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::{detached_start_summary, format_status_timestamp};
+    use crate::config::AppConfig;
+
+    fn test_config() -> AppConfig {
+        let state_dir = PathBuf::from("test-state");
+        AppConfig {
+            http_bind: "127.0.0.1".to_string(),
+            http_port: 15443,
+            log_level: "info".to_string(),
+            stop_grace_seconds: 5,
+            prompt_patterns: Vec::new(),
+            web_push_subject: None,
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            state_dir: state_dir.clone(),
+            sessions_dir: state_dir.join("sessions"),
+            db_file: state_dir.join("oly.db"),
+            lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
+            socket_name: "test.sock".to_string(),
+            socket_file: state_dir.join("daemon.sock"),
+            silence_seconds: 10,
+            session_eviction_seconds: 15,
+            max_running_sessions: 50,
+            notification_hook: None,
+        }
+    }
+
+    #[test]
+    fn detached_summary_includes_http_url_and_paths() {
+        let config = test_config();
+        let summary = detached_start_summary(&config, false, true);
+
+        assert!(summary.contains("HTTP:         http://127.0.0.1:15443"));
+        assert!(summary.contains("Auth:         disabled (--no-auth)"));
+        assert!(summary.contains(&format!("ROOT:         {}", config.state_dir.display())));
+        assert!(summary.contains(&format!(
+            "LOGS:         {}",
+            config.state_dir.join("logs").display()
+        )));
+        assert!(summary.contains(&format!("SESSIONS:     {}", config.sessions_dir.display())));
+    }
+
+    #[test]
+    fn detached_summary_marks_http_disabled() {
+        let config = test_config();
+        let summary = detached_start_summary(&config, true, false);
+
+        assert!(summary.contains("HTTP:         disabled (--no-http)"));
+        assert!(!summary.contains("Auth:"));
+    }
+
+    #[test]
+    fn status_timestamp_is_rendered_in_local_time() {
+        let raw = "2026-03-27T12:34:56Z";
+        let expected = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .to_rfc3339();
+
+        assert_eq!(format_status_timestamp(raw), expected);
+    }
+
+    #[test]
+    fn status_timestamp_falls_back_to_original_when_parse_fails() {
+        let raw = "not-a-timestamp";
+        assert_eq!(format_status_timestamp(raw), raw);
+    }
+}

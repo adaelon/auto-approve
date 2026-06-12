@@ -1,0 +1,331 @@
+use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+use crate::error::Result;
+
+/// Default prompt patterns used to detect interactive prompts in terminal output.
+/// These are intentionally broad to cover common shells, REPLs, and CLI tools.
+///
+/// To override, set `prompt_patterns` in your config file
+/// (`~/.local/share/oly/config.json` on Linux/macOS, `%LOCALAPPDATA%\oly\config.json` on Windows):
+///
+/// ```json
+/// {
+///     "prompt_patterns": [
+///         ">\\s*$",
+///         "(?i)password:",
+///         "… your own patterns here"
+///     ]
+/// }
+/// ```
+const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
+    // Shell / REPL prompt characters at end of line
+    r"[>❯›\$#%]\s*$",
+    r"❯\s+",
+    // `> text` at start of line (e.g. Gemini CLI input field)
+    r"^\s*>\s+\S",
+    // Python REPL
+    r">>>\s*$",
+    // Confirmation dialogs: (y/n), [y/n], [yes/no]
+    r"(?i)[\(\[](y/n|yes/no)[\)\]]",
+    // Credential / secret prompts
+    r"(?i)(?:password|api[_ ]?key|token|secret)\s*:",
+    // Inquirer-style "? " prefix
+    r"^\?\s",
+    // Natural-language questions ending with "?"
+    r"(?i)(?:do you|are you sure|allow\b).{0,80}\?",
+    // "Continue?" at end of line
+    r"(?i)continue\?\s*$",
+    // Press key to continue
+    r"(?i)press (?:enter|return|any key)",
+];
+
+#[derive(Debug)]
+pub struct AppConfig {
+    pub http_bind: String,
+    pub http_port: u16,
+    pub log_level: String,
+    pub stop_grace_seconds: u64,
+    pub prompt_patterns: Vec<String>,
+    pub web_push_subject: Option<String>,
+    pub web_push_vapid_public_key: Option<String>,
+    pub web_push_vapid_private_key: Option<String>,
+    pub state_dir: PathBuf,
+    pub sessions_dir: PathBuf,
+    pub db_file: PathBuf,
+    pub lock_file: PathBuf,
+    pub info_file: PathBuf,
+    pub socket_name: String,
+    pub socket_file: PathBuf,
+    pub silence_seconds: u64,
+    pub session_eviction_seconds: u64,
+    pub max_running_sessions: usize,
+    /// Optional path to an executable invoked on every local OS notification.
+    /// If this is provided, the default local notification mechanism is disabled and this hook is used instead.
+    pub notification_hook: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AppConfigOverrides {
+    bind: Option<String>,
+    http_port: Option<u16>,
+    log_level: Option<String>,
+    prompt_patterns: Option<Vec<String>>,
+    web_push_subject: Option<String>,
+    web_push_vapid_public_key: Option<String>,
+    web_push_vapid_private_key: Option<String>,
+    max_running_sessions: Option<usize>,
+    session_eviction_seconds: Option<u64>,
+    /// Path to an executable invoked on every local OS notification.
+    /// Event data is provided via environment variables (OLY_EVENT_*).
+    notification_hook: Option<String>,
+}
+
+impl AppConfig {
+    pub fn load() -> Result<Self> {
+        let state_dir = crate::storage::resolve_state_dir();
+        ensure_config_file(&state_dir);
+        let sessions_dir = state_dir.join("sessions");
+        let overrides = load_overrides(&state_dir);
+        let session_eviction_seconds = overrides.session_eviction_seconds.unwrap_or(15).max(1);
+        let http_bind = overrides
+            .bind
+            .and_then(normalize_optional_string)
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let http_port = overrides.http_port.unwrap_or(15443);
+        let log_level = overrides
+            .log_level
+            .and_then(normalize_optional_string)
+            .unwrap_or_else(|| "info".to_string());
+        let prompt_patterns = overrides.prompt_patterns.unwrap_or_else(|| {
+            DEFAULT_PROMPT_PATTERNS
+                .iter()
+                .map(|pattern| (*pattern).to_string())
+                .collect()
+        });
+        let web_push_vapid_public_key = overrides
+            .web_push_vapid_public_key
+            .and_then(normalize_optional_string);
+        let web_push_vapid_private_key = overrides
+            .web_push_vapid_private_key
+            .and_then(normalize_optional_string);
+        let web_push_subject = overrides
+            .web_push_subject
+            .and_then(normalize_optional_string);
+        let socket_name = std::env::var("OLY_SOCKET_NAME")
+            .ok()
+            .and_then(normalize_optional_string)
+            .unwrap_or_else(|| "open-relay.oly.sock".to_string());
+
+        let max_running_sessions = overrides.max_running_sessions.unwrap_or(50);
+        let notification_hook = overrides
+            .notification_hook
+            .and_then(normalize_optional_string);
+
+        Ok(Self {
+            log_level,
+            silence_seconds: 10,
+            stop_grace_seconds: 5,
+            session_eviction_seconds,
+            http_bind,
+            http_port,
+            prompt_patterns,
+            web_push_vapid_public_key,
+            web_push_vapid_private_key,
+            web_push_subject,
+            socket_name,
+            socket_file: state_dir.join("daemon.sock"),
+            lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
+            db_file: state_dir.join("oly.db"),
+            state_dir,
+            sessions_dir,
+            max_running_sessions,
+            notification_hook,
+        })
+    }
+
+    pub fn with_runtime_overrides(
+        mut self,
+        http_bind: Option<String>,
+        http_port: Option<u16>,
+        notification_hook: Option<String>,
+    ) -> Self {
+        if let Some(http_bind) = http_bind.and_then(normalize_optional_string) {
+            self.http_bind = http_bind;
+        }
+        if let Some(http_port) = http_port {
+            self.http_port = http_port;
+        }
+        if let Some(notification_hook) = notification_hook.and_then(normalize_optional_string) {
+            self.notification_hook = Some(notification_hook);
+        }
+        self
+    }
+
+    pub fn wwwroot_dir(&self) -> PathBuf {
+        self.state_dir.join("wwwroot")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Default config generation
+// ---------------------------------------------------------------------------
+
+/// Encode raw bytes as base64url without padding.
+fn base64url_no_pad(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((bytes.len() * 4 + 2) / 3);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Generate a random VAPID (P-256) key pair.
+/// Returns `(private_key_base64url, public_key_base64url)`.
+fn generate_vapid_keypair() -> (String, String) {
+    use p256::elliptic_curve::sec1::ToEncodedPoint as _;
+    use rand::RngCore as _;
+
+    // Retry until we land on a valid scalar (astronomically unlikely to loop more than once).
+    let secret = loop {
+        let mut key_bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key_bytes);
+        let fb = p256::elliptic_curve::FieldBytes::<p256::NistP256>::from(key_bytes);
+        if let Ok(sk) = p256::SecretKey::from_bytes(&fb) {
+            break sk;
+        }
+    };
+    let private_b64 = base64url_no_pad(secret.to_bytes().as_ref());
+    let public_b64 = base64url_no_pad(secret.public_key().to_encoded_point(false).as_bytes());
+    (private_b64, public_b64)
+}
+
+/// Create `config.json` with freshly generated VAPID keys if it does not exist.
+/// Silently skips on any I/O error so the rest of startup can continue.
+pub fn ensure_config_file(state_dir: &Path) {
+    let path = state_dir.join("config.json");
+    if path.exists() {
+        return;
+    }
+    if let Err(err) = std::fs::create_dir_all(state_dir) {
+        eprintln!("warning: could not create state dir: {err}");
+        return;
+    }
+    let (private_key, public_key) = generate_vapid_keypair();
+    let contents = serde_json::json!({
+        "web_push_vapid_public_key": public_key,
+        "web_push_vapid_private_key": private_key,
+        "web_push_subject": "mailto:admin@oly.com"
+    });
+    match serde_json::to_string_pretty(&contents) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => {
+                // Restrict permissions to owner-only since the file contains
+                // the VAPID private key.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) =
+                        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    {
+                        eprintln!(
+                            "warning: could not restrict config.json permissions to 0o600: {err}"
+                        );
+                    }
+                }
+                eprintln!("info: generated default config at {}", path.display());
+            }
+            Err(err) => eprintln!("warning: could not write config.json: {err}"),
+        },
+        Err(err) => eprintln!("warning: could not serialise default config: {err}"),
+    }
+}
+
+fn load_overrides(state_dir: &PathBuf) -> AppConfigOverrides {
+    let path = state_dir.join("config.json");
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return AppConfigOverrides::default();
+    };
+
+    serde_json::from_str::<AppConfigOverrides>(&raw).unwrap_or_default()
+}
+
+fn normalize_optional_string(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::AppConfig;
+
+    fn test_config() -> AppConfig {
+        let state_dir = PathBuf::from("test-state");
+        AppConfig {
+            http_bind: "127.0.0.1".to_string(),
+            http_port: 15443,
+            log_level: "info".to_string(),
+            stop_grace_seconds: 5,
+            prompt_patterns: Vec::new(),
+            web_push_subject: None,
+            web_push_vapid_public_key: None,
+            web_push_vapid_private_key: None,
+            state_dir: state_dir.clone(),
+            sessions_dir: state_dir.join("sessions"),
+            db_file: state_dir.join("oly.db"),
+            lock_file: state_dir.join("daemon.lock"),
+            info_file: state_dir.join("daemon.info"),
+            socket_name: "test.sock".to_string(),
+            socket_file: state_dir.join("daemon.sock"),
+            silence_seconds: 10,
+            session_eviction_seconds: 15,
+            max_running_sessions: 50,
+            notification_hook: Some("config-hook".to_string()),
+        }
+    }
+
+    #[test]
+    fn runtime_overrides_replace_port_and_notification_hook() {
+        let config = test_config().with_runtime_overrides(
+            Some(" 0.0.0.0 ".to_string()),
+            Some(17000),
+            Some("  C:/tools/notify.exe  ".to_string()),
+        );
+
+        assert_eq!(config.http_bind, "0.0.0.0");
+        assert_eq!(config.http_port, 17000);
+        assert_eq!(
+            config.notification_hook.as_deref(),
+            Some("C:/tools/notify.exe")
+        );
+    }
+
+    #[test]
+    fn runtime_overrides_leave_config_values_when_not_provided() {
+        let config = test_config().with_runtime_overrides(None, None, None);
+
+        assert_eq!(config.http_bind, "127.0.0.1");
+        assert_eq!(config.http_port, 15443);
+        assert_eq!(config.notification_hook.as_deref(), Some("config-hook"));
+    }
+}
