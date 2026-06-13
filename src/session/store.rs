@@ -1098,15 +1098,14 @@ impl SessionStore {
                     return None;
                 }
 
-                // If attach just happend, there is not need to notify in supression window, treat it as notified
-                if let Some(last_attach_activity) = rt.last_attach_activity_at {
-                    if now.duration_since(last_attach_activity) < attach_suppression_window {
-                        trace!("silent becase recent attach activity");
-                        drop(rt);
-                        let mut rt = handle.write();
-                        rt.last_notified_at = rt.last_output_epoch;
-                        return None;
-                    }
+                // Recent attach activity suppresses channel delivery (human is watching) but
+                // must NOT block auto-approve — we still want the LLM to handle the prompt.
+                let attach_suppressed = rt
+                    .last_attach_activity_at
+                    .map(|t| now.duration_since(t) < attach_suppression_window)
+                    .unwrap_or(false);
+                if attach_suppressed {
+                    trace!("recent attach activity: suppressing channel delivery, auto-approve still eligible");
                 }
 
                 // If output just happend, there is not need to notify in supression window, treat it as notified
@@ -1135,6 +1134,7 @@ impl SessionStore {
                     last_attach_activity_at = ?rt.last_attach_activity_at,
                     last_output_epoch = ?rt.last_output_epoch,
                     last_notified_at = ?rt.last_notified_at,
+                    attach_suppressed,
                     "silent candidate ready"
                 );
 
@@ -1147,11 +1147,54 @@ impl SessionStore {
                     session_title: rt.meta.title.clone(),
                     excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
                     output_epoch: last_output,
-                    enabled_for_channels: rt.notifications_enabled,
+                    enabled_for_channels: rt.notifications_enabled && !attach_suppressed,
                     last_total_bytes: rt.last_total_bytes,
                 })
             })
             .collect()
+    }
+
+    /// Returns running sessions eligible for an auto-approve evaluation,
+    /// regardless of output silence. Unlike [`Self::silent_candidates`], this does
+    /// NOT wait for the PTY to go quiet — coding-agent TUIs (e.g. claude) keep
+    /// redrawing a blinking confirmation prompt, so they never go silent. A
+    /// per-session `cooldown` on `last_auto_approve_at` throttles the LLM judge
+    /// and prevents re-approving the same prompt across redraws.
+    pub fn auto_approve_candidates(&self, cooldown: Duration) -> Vec<SilentCandidate> {
+        let now = Instant::now();
+        let sessions = self.sessions.load();
+        sessions
+            .values()
+            .filter_map(|handle| {
+                let rt = handle.read();
+                if rt.is_completed() {
+                    return None;
+                }
+                if let Some(last) = rt.last_auto_approve_at {
+                    if now.duration_since(last) < cooldown {
+                        return None;
+                    }
+                }
+                let excerpt = rt.render_logs(15, false, u16::MAX);
+                Some(SilentCandidate {
+                    session_id: rt.meta.id.clone(),
+                    session_title: rt.meta.title.clone(),
+                    excerpt: String::from_utf8_lossy(&excerpt).into_owned(),
+                    output_epoch: rt.last_output_epoch.unwrap_or(now),
+                    enabled_for_channels: false,
+                    last_total_bytes: rt.last_total_bytes,
+                })
+            })
+            .collect()
+    }
+
+    /// Stamps `last_auto_approve_at` so the session enters the auto-approve
+    /// cooldown window (see [`Self::auto_approve_candidates`]).
+    pub fn mark_auto_approve_checked(&self, session_id: &str, at: Instant) {
+        let sessions = self.sessions.load();
+        if let Some(handle) = sessions.get(session_id) {
+            handle.write().last_auto_approve_at = Some(at);
+        }
     }
 
     /// Records a successful notification for `session_id` at `output_epoch`.
@@ -1305,6 +1348,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            last_auto_approve_at: None,
             screen_parser,
             output_closed: false,
             notifications_enabled: true,
@@ -1909,6 +1953,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            last_auto_approve_at: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -1969,6 +2014,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            last_auto_approve_at: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,

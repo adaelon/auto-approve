@@ -462,6 +462,12 @@ async fn run_foreground(config: AppConfig, auth_hash: Option<String>, no_http: b
 
     let pid = std::process::id();
     info!(pid, log_level = %config.log_level, "daemon started");
+    info!(
+        auto_approve_enabled = config.auto_approve.enabled,
+        auto_approve_model = %config.auto_approve.model,
+        auto_approve_api_url = %config.auto_approve.api_url,
+        "auto-approve config"
+    );
 
     let db = Arc::new(Database::open(&config.db_file, config.sessions_dir.clone()).await?);
     info!(db_file = ?config.db_file, "database opened");

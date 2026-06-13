@@ -40,6 +40,8 @@ const DEFAULT_PROMPT_PATTERNS: &[&str] = &[
     r"(?i)continue\?\s*$",
     // Press key to continue
     r"(?i)press (?:enter|return|any key)",
+    // Codex / aider-style numbered confirmation menu ("1. Yes, proceed")
+    r"(?m)^\s*1\.\s+[Yy]es",
 ];
 
 #[derive(Debug)]

@@ -106,6 +106,7 @@ struct ChatChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChatMessage {
+    #[serde(default)]
     content: String,
 }
 
@@ -114,24 +115,29 @@ struct ChatMessage {
 // ---------------------------------------------------------------------------
 
 const SYSTEM_PROMPT: &str = "\
-You are a safety gate for terminal commands.
-A CLI agent is waiting for user confirmation to run a command.
-Look at the bash command visible in the screen content and decide if it is safe to auto-approve.
+You are a safety gate for a NUMBERED confirmation prompt.
+The screen shows a CLI agent (e.g. Claude Code, Codex) paused on a permission
+menu like:
+  Do you want to proceed?
+  > 1. Yes
+    2. Yes, and allow ... (always)
+    3. No
+Look at the command/action being confirmed and decide whether to auto-approve it.
 
 Reply EXACTLY one line in one of these formats:
-APPROVE: <text to send>
-APPROVE: key:<key_name>
+APPROVE: <number>
 DENY: <short reason>
 UNCERTAIN: <short reason>
 
 Rules:
-- Approve only clearly non-destructive commands: reading files, listing, git operations, \
-  installing packages from trusted sources, routine confirmations
-- DENY commands involving: sudo, rm -rf, mkfs, format, drop database, overwrite configs, \
-  expose secrets, redirect critical system files
-- When in doubt, reply UNCERTAIN
-- For simple y/N confirmations of safe commands, prefer APPROVE: key:enter
-- Never approve anything that could cause data loss or security exposure";
+- The screen IS a numbered confirmation menu. Choose the plain \"Yes\" option \
+  (the one that proceeds once, usually \"1\"), NOT a \"Yes, and always allow\" option.
+- APPROVE safe actions: reading/listing files, checking versions, building, \
+  running tests, git status/diff/log, installing known packages, routine inspection.
+- DENY clearly destructive actions: rm -rf, mkfs, format disk, drop database, \
+  overwriting critical configs, exposing/exfiltrating secrets, sudo rm.
+- If the action's safety is genuinely unclear, reply UNCERTAIN.
+- Reply with ONLY the single line, e.g. \"APPROVE: 1\".";
 
 // ---------------------------------------------------------------------------
 // AutoApprover
@@ -159,7 +165,13 @@ impl AutoApprover {
 
         debug!(model = %self.config.model, "sending auto-approve request");
 
-        let response = match self.client.post(&url).json(&body).send().await {
+        let response = match self.client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(err) => {
                 warn!(%err, "auto-approve LLM request failed");
@@ -169,10 +181,22 @@ impl AutoApprover {
             }
         };
 
-        let chat: ChatResponse = match response.json().await {
+        let status = response.status();
+        let raw_body = match response.text().await {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(%err, "auto-approve LLM response read failed");
+                return ApprovalDecision::Uncertain {
+                    reason: format!("response read error: {err}"),
+                };
+            }
+        };
+        debug!(status = %status, body = %raw_body, "auto-approve LLM raw response");
+
+        let chat: ChatResponse = match serde_json::from_str(&raw_body) {
             Ok(c) => c,
             Err(err) => {
-                warn!(%err, "auto-approve LLM response parse failed");
+                warn!(%err, status = %status, body = %raw_body, "auto-approve LLM response parse failed");
                 return ApprovalDecision::Uncertain {
                     reason: format!("response parse error: {err}"),
                 };
@@ -209,7 +233,7 @@ impl AutoApprover {
                 { "role": "user", "content": screen_text }
             ],
             "temperature": 0.0,
-            "max_tokens": 64,
+            "max_tokens": 1024,
         })
     }
 
@@ -227,8 +251,12 @@ impl AutoApprover {
                     chunks: vec![InputChunk::Key("enter".to_string())],
                 }
             } else {
+                // Always append Enter so the PTY submits the typed text
                 ApprovalDecision::Approve {
-                    chunks: vec![InputChunk::Text(rest.to_string())],
+                    chunks: vec![
+                        InputChunk::Text(rest.to_string()),
+                        InputChunk::Key("enter".to_string()),
+                    ],
                 }
             }
         } else if let Some(reason) = line.strip_prefix("DENY:") {
@@ -262,8 +290,9 @@ mod tests {
         let dec = approver.parse_decision("APPROVE: yes");
         match dec {
             ApprovalDecision::Approve { chunks } => {
-                assert_eq!(chunks.len(), 1);
+                assert_eq!(chunks.len(), 2);
                 assert!(matches!(&chunks[0], InputChunk::Text(t) if t == "yes"));
+                assert!(matches!(&chunks[1], InputChunk::Key(k) if k == "enter"));
             }
             _ => panic!("expected Approve, got {dec:?}"),
         }
@@ -337,5 +366,53 @@ mod tests {
 
     fn test_approver() -> AutoApprover {
         AutoApprover::new(AutoApproveConfig::default())
+    }
+
+    // append_approval_log tests
+    #[test]
+    fn append_approval_log_writes_json_line() {
+        let base = std::env::temp_dir().join(format!("oly-test-{}", std::process::id()));
+        let session_id = "alog-write";
+        let sessions_dir = base.join("sessions");
+        std::fs::create_dir_all(sessions_dir.join(session_id)).unwrap();
+
+        let entry = ApprovalLogEntry {
+            ts: "2026-01-01T00:00:00Z".to_string(),
+            decision: "approve".to_string(),
+            chunks: Some(vec![InputChunk::Key("enter".to_string())]),
+            reason: None,
+        };
+        append_approval_log(&sessions_dir, session_id, &entry);
+
+        let content = std::fs::read_to_string(sessions_dir.join(session_id).join("approval.log")).unwrap();
+        assert!(content.contains("\"decision\":\"approve\""), "missing decision");
+        assert!(content.contains("\"ts\":\"2026-01-01T00:00:00Z\""), "missing ts");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn append_approval_log_appends_multiple_lines() {
+        let base = std::env::temp_dir().join(format!("oly-test-multi-{}", std::process::id()));
+        let session_id = "alog-multi";
+        let sessions_dir = base.join("sessions");
+        std::fs::create_dir_all(sessions_dir.join(session_id)).unwrap();
+
+        for decision in ["approve", "deny", "uncertain"] {
+            append_approval_log(
+                &sessions_dir,
+                session_id,
+                &ApprovalLogEntry {
+                    ts: "2026-01-01T00:00:00Z".to_string(),
+                    decision: decision.to_string(),
+                    chunks: None,
+                    reason: None,
+                },
+            );
+        }
+
+        let content = std::fs::read_to_string(sessions_dir.join(session_id).join("approval.log")).unwrap();
+        let lines: Vec<_> = content.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -74,6 +74,9 @@ pub struct SessionRuntime {
     pub last_notified_at: Option<Instant>,
     /// The value of `last_output_at` at the time the last notification was sent.
     pub notified_output_epoch: Option<Instant>,
+    /// Timestamp of the last auto-approve evaluation. Throttles the LLM judge so
+    /// an animated/blinking confirmation prompt is not re-judged every tick.
+    pub last_auto_approve_at: Option<Instant>,
     /// Live rendered terminal state for attach snapshot restoration.
     pub screen_parser: vt100::Parser,
     /// Set once the PTY reader has reached EOF or a terminal read error.
@@ -389,6 +392,13 @@ pub fn spawn_session(
 
     let mut cmd = CommandBuilder::new(cmd);
     cmd.args(&meta.args);
+    // `CommandBuilder::new` seeds the child environment from the daemon's own
+    // environment. If the daemon was launched from inside a Claude Code session
+    // (or any tool that exports its session markers), those markers leak into
+    // managed sessions and make a nested `claude` think it is a child session,
+    // which breaks its OAuth flow (403) and disables plugins. Strip them so each
+    // managed session starts from a clean slate.
+    strip_inherited_session_markers(&mut cmd);
     let cwd_fallback = full_dir.to_string_lossy().into_owned();
     cmd.cwd(meta.cwd.as_ref().unwrap_or(&cwd_fallback));
 
@@ -488,6 +498,7 @@ pub fn spawn_session(
         last_attach_activity_at: None,
         attach_count: 0,
         notified_output_epoch: None,
+        last_auto_approve_at: None,
         last_notified_at: None,
         screen_parser: vt100::Parser::new(rows, cols, 0),
         output_closed: false,
@@ -616,6 +627,54 @@ fn format_command_for_display(command: &str, args: &[String]) -> String {
     format!("{} {}", command, args.join(" "))
 }
 
+/// Environment variables that match the `CLAUDE_CODE_*` strip pattern but must
+/// be preserved: they carry auth that a managed `claude` session legitimately
+/// needs. `CLAUDE_CODE_OAUTH_TOKEN` (and its file-descriptor variant) is a
+/// static token taken as `getAuthTokenSource()` priority #2, ahead of the
+/// `~/.claude/.credentials.json` file. Passing it through lets a nested `claude`
+/// authenticate without touching the file's single-use refresh token, avoiding
+/// the cross-process refresh-token rotation race that otherwise yields OAuth 403.
+const SESSION_ENV_PASSTHROUGH: &[&str] = &[
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+];
+
+/// Remove environment markers that the daemon may have inherited from a parent
+/// tool's session, so they do not leak into managed PTY sessions. Targets Claude
+/// Code's self-identification markers (`CLAUDECODE`, `CLAUDE_CODE_*`, and the
+/// generic `AI_AGENT=claude-code_..._agent`). If these leak into a nested
+/// `claude`, it concludes it is running inside another agent and enters a
+/// degraded mode: OAuth refresh returns 403 and plugins are disabled. `codex`
+/// and other CLIs ignore these vars, which is why only `claude` is affected.
+///
+/// Variables in [`SESSION_ENV_PASSTHROUGH`] are exempt — they carry auth a
+/// managed session is meant to receive.
+fn strip_inherited_session_markers(cmd: &mut CommandBuilder) {
+    // `CommandBuilder` seeds its env from `std::env`, so look there for the keys
+    // to drop. Collect first to avoid borrowing the builder while mutating it.
+    let to_remove: Vec<String> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v)))
+        .filter(|(k, v)| should_strip_session_marker(k, v.to_str().unwrap_or("")))
+        .map(|(k, _)| k)
+        .collect();
+    for key in to_remove {
+        cmd.env_remove(&key);
+    }
+}
+
+/// Decide whether an inherited env var is a session marker to drop. Pure so it
+/// can be unit-tested without mutating the process environment.
+fn should_strip_session_marker(key: &str, value: &str) -> bool {
+    if SESSION_ENV_PASSTHROUGH.contains(&key) {
+        return false;
+    }
+    key == "CLAUDECODE"
+        || key.starts_with("CLAUDE_CODE_")
+        // AI_AGENT is a generic "I am an AI agent" marker; only strip it when it
+        // identifies a claude-code agent, leaving other uses be.
+        || (key == "AI_AGENT" && value.contains("claude"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +684,33 @@ mod tests {
     fn test_generate_session_id_is_7_chars() {
         let id = generate_session_id(|_| false);
         assert_eq!(id.len(), 7, "session id must be exactly 7 characters");
+    }
+
+    #[test]
+    fn strip_marker_drops_claude_code_identity_vars() {
+        assert!(should_strip_session_marker("CLAUDECODE", "1"));
+        assert!(should_strip_session_marker("CLAUDE_CODE_ENTRYPOINT", "cli"));
+        assert!(should_strip_session_marker("CLAUDE_CODE_SESSION_ID", "abc"));
+        assert!(should_strip_session_marker(
+            "AI_AGENT",
+            "claude-code_2-1-177_agent"
+        ));
+    }
+
+    #[test]
+    fn strip_marker_preserves_oauth_token_passthrough() {
+        assert!(!should_strip_session_marker("CLAUDE_CODE_OAUTH_TOKEN", "sk-xyz"));
+        assert!(!should_strip_session_marker(
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+            "7"
+        ));
+    }
+
+    #[test]
+    fn strip_marker_leaves_unrelated_vars_alone() {
+        assert!(!should_strip_session_marker("PATH", "/usr/bin"));
+        assert!(!should_strip_session_marker("AI_AGENT", "some-other-agent"));
+        assert!(!should_strip_session_marker("USERPROFILE", "C:\\Users\\x"));
     }
 
     #[test]
@@ -710,6 +796,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            last_auto_approve_at: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
@@ -1000,6 +1087,7 @@ mod tests {
             attach_count: 0,
             last_notified_at: None,
             notified_output_epoch: None,
+            last_auto_approve_at: None,
             screen_parser: vt100::Parser::new(24, 80, 0),
             output_closed: false,
             notifications_enabled: true,
